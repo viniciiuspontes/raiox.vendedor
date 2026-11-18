@@ -13,6 +13,27 @@ from src.regras import (card_atraso, card_categoria, card_frete, card_mercado, c
 
 st.set_page_config(page_title="Raio-X do Vendedor", page_icon="🔎", layout="centered")
 
+with st.expander("🔌 Teste de conexão (remover depois)", expanded=True):
+    for k in ("DATABRICKS_HOST", "DATABRICKS_HTTP_PATH", "DATABRICKS_TOKEN", "RAIOX_PATH"):
+        try:
+            ok = k in st.secrets
+        except Exception:
+            ok = False
+        st.write(f"{'✅' if ok else '❌'} {k}")
+    if st.button("Testar SQL Warehouse"):
+        try:
+            from databricks import sql
+            host = str(st.secrets["DATABRICKS_HOST"]).replace("https://", "").rstrip("/")
+            with sql.connect(server_hostname=host,
+                             http_path=str(st.secrets["DATABRICKS_HTTP_PATH"]),
+                             access_token=str(st.secrets["DATABRICKS_TOKEN"]),
+                             _socket_timeout=60) as conn, conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM parquet.`/Volumes/workspace/olist_gold/parquet/gold_ref_rotas`")
+                st.success(f"Conectou! gold_ref_rotas tem {cur.fetchone()[0]} linhas.")
+        except Exception as e:
+            st.error(f"{type(e).__name__}: {e}")
+    st.stop()
+
 
 # ---------------- Tema (claro / escuro) ----------------
 def _tema_escuro() -> bool:
