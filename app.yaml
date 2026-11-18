@@ -1,0 +1,9 @@
+command: ["streamlit", "run", "streamlit_app.py"]
+env:
+  - name: RAIOX_PATH
+    value: "/Volumes/workspace/olist_gold/parquet"
+  - name: RAIOX_PRED_PATH
+    value: "/Volumes/workspace/olist_gold/ml_predictions"
+  # Nome do endpoint de Model Serving do modelo de risco de atraso (vazio = usa as probabilidades gravadas)
+  - name: RAIOX_MODEL_ENDPOINT
+    value: ""
