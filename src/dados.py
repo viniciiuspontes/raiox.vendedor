@@ -32,8 +32,21 @@ def _ler_local(base, tabela):
 
 @st.cache_resource
 def _cliente():
+    import os
     from databricks.sdk import WorkspaceClient
-    return WorkspaceClient()
+
+    def _segredo(nome):
+        try:
+            if nome in st.secrets:
+                return str(st.secrets[nome]).strip()
+        except Exception:  # sem secrets.toml (ex.: Databricks Apps)
+            pass
+        return os.getenv(nome)
+
+    host, token = _segredo("DATABRICKS_HOST"), _segredo("DATABRICKS_TOKEN")
+    if host and token:                       # Streamlit Cloud: token pessoal
+        return WorkspaceClient(host=host.rstrip("/"), token=token)
+    return WorkspaceClient()                 # Databricks Apps: credencial automática do app
 
 
 def _listar_parquet(w, pasta):
