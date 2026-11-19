@@ -42,9 +42,6 @@ st.markdown(f"""<style>
     --rx-texto: {PALETA['texto']}; --rx-suave: {PALETA['suave']}; --rx-fraco: {PALETA['fraco']};
     --rx-apagado: {PALETA['apagado']}; --rx-sombra: {PALETA['sombra']};
 }}
-header[data-testid="stHeader"], div[data-testid="stToolbar"], div[data-testid="stDecoration"] {{
-    display: none !important; height: 0 !important;
-}}
 .stApp, [data-testid="stAppViewContainer"], [data-testid="stMain"], [data-testid="stMainBlockContainer"],
 [data-testid="stAppViewBlockContainer"], .block-container {{ padding-top: 2.5rem !important; margin-top: 0 !important; }}
 .block-container, [data-testid="stMainBlockContainer"] {{ max-width: 880px !important; padding-bottom: 2.5rem !important; }}
