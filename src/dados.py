@@ -1,7 +1,9 @@
 """Leitura das tabelas Gold (Parquet) do Volume e ajuste dos nomes de colunas ao app.
 
-- Databricks Apps: Files API do databricks-sdk, com o service principal do app.
-- Cluster ou teste local: lê direto do disco quando o caminho existe.
+Ordem de leitura:
+1. Cópia local (pasta existe no disco)               -> lê os arquivos direto
+2. Streamlit Cloud (DATABRICKS_HTTP_PATH nos Secrets) -> SQL Warehouse, 1 consulta por tabela
+3. Databricks Apps                                    -> Files API com o service principal do app
 """
 import io
 import os
@@ -16,7 +18,23 @@ class TabelaNaoEncontrada(Exception):
     pass
 
 
-# ---------------- leitura ----------------
+# ---------------- credenciais ----------------
+def _segredo(nome):
+    """Lê do st.secrets (Streamlit Cloud) ou da variável de ambiente (Databricks Apps)."""
+    try:
+        if nome in st.secrets:
+            return str(st.secrets[nome]).strip()
+    except Exception:  # sem secrets.toml
+        pass
+    v = os.getenv(nome)
+    return v.strip() if v else None
+
+
+def usa_warehouse() -> bool:
+    return bool(_segredo("DATABRICKS_HTTP_PATH") and _segredo("DATABRICKS_TOKEN"))
+
+
+# ---------------- 1) leitura local ----------------
 def _ler_local(base, tabela):
     for alvo in (os.path.join(base, tabela), os.path.join(base, f"{tabela}.parquet")):
         if os.path.isdir(alvo):
@@ -30,21 +48,27 @@ def _ler_local(base, tabela):
     raise TabelaNaoEncontrada(f"{tabela} não encontrada em {base}")
 
 
+# ---------------- 2) SQL Warehouse ----------------
+def ler_sql(caminho: str, colunas: str = "*") -> pd.DataFrame:
+    """Lê uma pasta Parquet do Volume via SQL Warehouse (uma consulta só)."""
+    from databricks import sql
+    host = _segredo("DATABRICKS_HOST").replace("https://", "").replace("http://", "").rstrip("/")
+    with sql.connect(server_hostname=host,
+                     http_path=_segredo("DATABRICKS_HTTP_PATH"),
+                     access_token=_segredo("DATABRICKS_TOKEN"),
+                     _socket_timeout=120) as conn, conn.cursor() as cur:
+        cur.execute(f"SELECT {colunas} FROM parquet.`{caminho}`")
+        return cur.fetchall_arrow().to_pandas()
+
+
+# ---------------- 3) Files API (Databricks Apps) ----------------
 @st.cache_resource
 def _cliente():
-    import os
     from databricks.sdk import WorkspaceClient
-
-    def _segredo(nome):
-        try:
-            if nome in st.secrets:
-                return str(st.secrets[nome]).strip()
-        except Exception:  # sem secrets.toml (ex.: Databricks Apps)
-            pass
-        return os.getenv(nome)
-
     host, token = _segredo("DATABRICKS_HOST"), _segredo("DATABRICKS_TOKEN")
-    if host and token:                       # Streamlit Cloud: token pessoal
+    if host and token:
+        if not host.startswith("http"):
+            host = "https://" + host
         return WorkspaceClient(host=host.rstrip("/"), token=token)
     return WorkspaceClient()                 # Databricks Apps: credencial automática do app
 
@@ -78,8 +102,12 @@ def _ler_sdk(base, tabela):
 
 @st.cache_data(ttl=3600, show_spinner="Carregando dados da camada Gold...")
 def ler_bruto(tabela):
-    base = C.BASE_PATH.rstrip("/")
-    return _ler_local(base, tabela) if os.path.isdir(base) else _ler_sdk(base, tabela)
+    base = (_segredo("RAIOX_PATH") or C.BASE_PATH).rstrip("/")
+    if os.path.isdir(base):                  # 1) cópia local
+        return _ler_local(base, tabela)
+    if usa_warehouse():                      # 2) Streamlit Cloud: SQL Warehouse
+        return ler_sql(f"{base}/{tabela}")
+    return _ler_sdk(base, tabela)            # 3) Databricks Apps
 
 
 # ---------------- padronização ----------------
