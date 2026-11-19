@@ -1,14 +1,11 @@
-"""Analisa a base `predictions` (Volume ml_predictions) e roda o modelo de ML para prever o risco do cenário.
-Fluxo: lê a base -> filtra o cenário (categoria, UF, preço, peso) -> monta as features dos pedidos
--> chama o modelo (Model Serving) -> calcula risco médio, % de alto risco e nº de pedidos.
-Se o endpoint não estiver configurado ou falhar, usa as probabilidades já gravadas na base.
+"""Analisa a base `predictions` (Volume ml_predictions) e calcula o risco de atraso do cenário.
+Fluxo: lê a base -> filtra o cenário (categoria, UF, preço, peso) -> usa as probabilidades do modelo
+(gravadas na Gold ou, se configurado, o modelo ao vivo no Model Serving) -> risco médio, % alto risco e nº de pedidos.
 
-Classificação de risco: usa as faixas que o modelo gravou na Gold (coluna `nivel_risco`).
-Faixas atuais na base (32.450 pedidos de teste):
+Classificação de risco: faixas que o modelo gravou na Gold (coluna `nivel_risco`).
     baixo  ->  0,2% a  7,3%  · atraso real  2,7%  · 19.470 pedidos
     medio  ->  7,3% a 13,6%  · atraso real  6,9%  ·  9.735 pedidos
     alto   -> 13,6% a 45,5%  · atraso real 16,2%  ·  3.245 pedidos
-Os limites são lidos da própria base a cada carga; os valores abaixo só são usados se a coluna não existir.
 """
 import io
 import json
@@ -17,22 +14,25 @@ import os
 import pandas as pd
 import streamlit as st
 
-BASE_PRED = os.getenv("RAIOX_PRED_PATH", "/Volumes/workspace/olist_gold/ml_predictions")
-T_PRED = "predictions"
-ENDPOINT = os.getenv("RAIOX_MODEL_ENDPOINT", "").strip()   # nome do endpoint de Model Serving
-LIMIAR_ALTO = 0.5     # usado só se a base não tiver a coluna `threshold`
-MAX_CENARIO = 1000    # máx. de pedidos do cenário enviados ao modelo (amostra fixa, reprodutível)
-MAX_CATEGORIA = 500   # amostra da categoria inteira, usada como referência de comparação
-LOTE = 250            # registros por chamada ao endpoint
+from src.dados import _cliente, _segredo, ler_sql, usa_warehouse
 
-# Faixas de risco do modelo (Gold, coluna nivel_risco) -> rótulo e cor do card
+BASE_PRED = (_segredo("RAIOX_PRED_PATH") or "/Volumes/workspace/olist_gold/ml_predictions").rstrip("/")
+T_PRED = "predictions"
+ENDPOINT = (_segredo("RAIOX_MODEL_ENDPOINT") or "").strip()   # endpoint do Model Serving (vazio = não usa)
+LIMIAR_ALTO = 0.5
+MAX_CENARIO = 1000
+MAX_CATEGORIA = 500
+LOTE = 250
+
+# Colunas lidas pelo SQL Warehouse (evita trazer inputs_json/outputs_json, que são grandes)
+COLUNAS_SQL = ("order_id, categoria, seller_state, valor_produtos, peso_total_g, "
+               "probability, predicted_label, threshold, nivel_risco, model_name")
+
 NIVEIS = {"baixo": ("Baixo", "verde"), "medio": ("Moderado", "amarelo"), "médio": ("Moderado", "amarelo"),
           "moderado": ("Moderado", "amarelo"), "alto": ("Alto", "vermelho")}
 ORDEM_NIVEIS = ["baixo", "medio", "alto"]
-# Início de cada faixa (probabilidade 0–1). Reserva, caso a base não tenha nivel_risco.
 FAIXAS_PADRAO = {"baixo": 0.0, "medio": 0.073, "alto": 0.136}
 
-# Nomes possíveis das colunas (a primeira que existir é usada).
 COLUNAS = {
     "categoria": ["categoria", "product_category_name_english", "product_category_name"],
     "uf": ["seller_state", "uf", "uf_origem", "estado"],
@@ -42,7 +42,6 @@ COLUNAS = {
     "alto": ["predicted_label", "risco_alto", "alto_risco", "is_high_risk", "flag_alto_risco"],
     "pedido": ["order_id", "pedido_id"],
 }
-# Colunas que NÃO são features do modelo (só usadas se a base não tiver inputs_json)
 META = {"prediction_id", "order_id", "pedido_id", "probability", "predicted_label", "actual_label", "threshold",
         "prediction_type", "model_name", "model_version", "prediction_timestamp", "inputs_json", "outputs_json",
         "nivel_risco"}
@@ -52,34 +51,22 @@ def _col(df: pd.DataFrame, chave: str):
     return next((c for c in COLUNAS[chave] if c in df.columns), None)
 
 
-# ---------------- Leitura da base (Files API do Databricks SDK, service principal do app) ----------------
-@st.cache_resource
-def _cliente():
-    import os
-    from databricks.sdk import WorkspaceClient
-
-    def _segredo(nome):
-        try:
-            if nome in st.secrets:
-                return str(st.secrets[nome]).strip()
-        except Exception:  # sem secrets.toml (ex.: Databricks Apps)
-            pass
-        return os.getenv(nome)
-
-    host, token = _segredo("DATABRICKS_HOST"), _segredo("DATABRICKS_TOKEN")
-    if host and token:                       # Streamlit Cloud: token pessoal
-        return WorkspaceClient(host=host.rstrip("/"), token=token)
-    return WorkspaceClient()                 # Databricks Apps: credencial automática do app
-
-
-
-def _listar(path: str):
-    return list(_cliente().files.list_directory_contents(path))
+# ---------------- Leitura da base ----------------
+def _ler_local():
+    for local in (os.path.join(BASE_PRED, f"{T_PRED}.parquet"), os.path.join(BASE_PRED, T_PRED)):
+        if os.path.isfile(local):
+            return pd.read_parquet(local)
+        if os.path.isdir(local):
+            arqs = sorted(os.path.join(r, f) for r, _, fs in os.walk(local) for f in fs
+                          if f.endswith(".parquet") and not f.startswith(("_", ".")))
+            if arqs:
+                return pd.concat([pd.read_parquet(a) for a in arqs], ignore_index=True)
+    return None
 
 
 def _parquets(path: str) -> list:
     achados = []
-    for e in _listar(path):
+    for e in _cliente().files.list_directory_contents(path):
         if e.is_directory:
             if not e.name.startswith(("_", ".")):
                 achados += _parquets(e.path)
@@ -92,9 +79,14 @@ def _ler_arquivo(path: str) -> pd.DataFrame:
     return pd.read_parquet(io.BytesIO(_cliente().files.download(path).contents.read()))
 
 
-@st.cache_data(ttl=600, show_spinner="Analisando a base de predictions…")
+@st.cache_data(ttl=3600, show_spinner="Analisando a base de predictions…")
 def carregar_predictions() -> pd.DataFrame:
-    erros = []
+    local = _ler_local()                                  # 1) cópia local
+    if local is not None:
+        return local
+    if usa_warehouse():                                   # 2) Streamlit Cloud: SQL Warehouse
+        return ler_sql(f"{BASE_PRED}/{T_PRED}", COLUNAS_SQL)
+    erros = []                                            # 3) Databricks Apps: Files API
     for p in (f"{BASE_PRED}/{T_PRED}", f"{BASE_PRED}/{T_PRED}.parquet"):
         try:
             if p.endswith(".parquet"):
@@ -111,17 +103,15 @@ def carregar_predictions() -> pd.DataFrame:
 # ---------------- Faixas de risco da Gold ----------------
 def _risco(serie: pd.Series) -> pd.Series:
     r = serie.astype(float)
-    return r / 100 if r.max() > 1 else r  # aceita escala 0–1 ou 0–100
+    return r / 100 if r.max() > 1 else r
 
 
 def _nivel_pedidos(frame: pd.DataFrame) -> pd.Series:
-    """Faixa de cada pedido, normalizada (baixo / medio / alto)."""
     return (frame["nivel_risco"].astype(str).str.strip().str.lower()
             .replace({"médio": "medio", "moderado": "medio"}))
 
 
-def faixas_gold(base: pd.DataFrame, col_prob: str | None) -> dict:
-    """Início de cada faixa (menor probabilidade de cada nivel_risco). Ex.: {'baixo':0.002,'medio':0.073,'alto':0.136}"""
+def faixas_gold(base: pd.DataFrame, col_prob) -> dict:
     if col_prob and "nivel_risco" in base.columns:
         inicio = _risco(base[col_prob]).groupby(_nivel_pedidos(base)).min().to_dict()
         if inicio:
@@ -130,7 +120,6 @@ def faixas_gold(base: pd.DataFrame, col_prob: str | None) -> dict:
 
 
 def classificar(prob: float, faixas: dict) -> str:
-    """Encaixa uma probabilidade na faixa da Gold (a maior faixa cujo início é <= prob)."""
     nivel = min(faixas, key=faixas.get)
     for nome, inicio in sorted(faixas.items(), key=lambda x: x[1]):
         if prob >= inicio:
@@ -138,9 +127,8 @@ def classificar(prob: float, faixas: dict) -> str:
     return nivel
 
 
-# ---------------- Modelo de ML (Model Serving) ----------------
+# ---------------- Modelo de ML ao vivo (opcional) ----------------
 def _features(frame: pd.DataFrame) -> pd.DataFrame:
-    """Features exatamente como o modelo recebeu na predição gravada (inputs_json); senão, colunas não-meta."""
     if "inputs_json" in frame.columns:
         try:
             linhas = []
@@ -161,12 +149,11 @@ def _para_prob(p) -> float:
     if isinstance(p, dict):
         p = p.get("probability", p.get("prob", next(iter(p.values()))))
     if isinstance(p, (list, tuple)):
-        p = p[-1]  # [P(classe 0), P(classe 1)] -> P(atraso)
+        p = p[-1]
     return float(p)
 
 
 def prever_modelo(frame: pd.DataFrame) -> pd.Series:
-    """Envia os pedidos ao endpoint do modelo e devolve a probabilidade de atraso de cada um."""
     registros = json.loads(_features(frame).to_json(orient="records"))
     saida = []
     for i in range(0, len(registros), LOTE):
@@ -182,7 +169,7 @@ def _amostra(frame: pd.DataFrame, n: int) -> pd.DataFrame:
     return frame if len(frame) <= n else frame.sample(n, random_state=0)
 
 
-@st.cache_data(ttl=600, show_spinner="Rodando o modelo no cenário…")
+@st.cache_data(ttl=600, show_spinner="Calculando o risco do cenário…")
 def calcular_cenario(_df, categoria, uf, preco_min, preco_max, peso_min, peso_max) -> dict:
     c = {k: _col(_df, k) for k in COLUNAS}
     faltando = [k for k in ("categoria", "uf", "preco", "peso") if not c[k]]
@@ -196,23 +183,18 @@ def calcular_cenario(_df, categoria, uf, preco_min, preco_max, peso_min, peso_ma
     if f.empty:
         return {"pedidos": 0, "base": len(_df)}
 
-    faixas = faixas_gold(_df, c["risco"])           # limites das faixas, lidos da Gold
+    faixas = faixas_gold(_df, c["risco"])
     inicio_alto = faixas.get("alto", FAIXAS_PADRAO["alto"])
     thr = float(f["threshold"].median()) if "threshold" in f.columns and f["threshold"].notna().any() else LIMIAR_ALTO
 
-    # 1) Probabilidades já gravadas na base (Gold)
     fonte, aviso, amostra = "probabilidades gravadas na base", None, len(f)
     if c["risco"]:
         risco = _risco(f[c["risco"]])
-        if "nivel_risco" in f.columns:
-            alto = _nivel_pedidos(f).eq("alto")      # pedidos na faixa alta do modelo
-        else:
-            alto = risco >= inicio_alto
+        alto = _nivel_pedidos(f).eq("alto") if "nivel_risco" in f.columns else risco >= inicio_alto
         risco_cat = float(_risco(base_cat[c["risco"]]).mean())
     else:
         risco, alto, risco_cat = None, None, None
 
-    # 2) Modelo de ML ao vivo (opcional): mesmas faixas da Gold
     if ENDPOINT:
         try:
             am = _amostra(f, MAX_CENARIO)
@@ -228,7 +210,7 @@ def calcular_cenario(_df, categoria, uf, preco_min, preco_max, peso_min, peso_ma
         raise RuntimeError(f"não foi possível prever o risco: {aviso}")
 
     medio, pct = float(risco.mean()), float(alto.mean())
-    faixa = classificar(medio, faixas)                # risco médio do cenário na faixa da Gold
+    faixa = classificar(medio, faixas)
     nivel, cor = NIVEIS.get(faixa, (faixa.capitalize(), "amarelo"))
     nome = f["model_name"].dropna() if "model_name" in f.columns else []
     return {
@@ -247,7 +229,6 @@ def recomendacoes_cenario(ind: dict) -> list:
         recs.append("Risco de atraso elevado neste cenário: revise o prazo prometido e a transportadora.")
     elif ind["nivel"] == "Moderado":
         recs.append("Risco de atraso moderado: acompanhe a postagem e evite prometer prazos curtos.")
-    # Na base inteira, 10% dos pedidos estão na faixa alta; acima disso o cenário merece atenção.
     if ind["pct_alto"] >= 0.10:
         recs.append(f"{fmt_pct(ind['pct_alto'])} dos pedidos estão na faixa de alto risco do modelo: "
                     "acrescente margem no prazo de entrega.")
@@ -267,13 +248,9 @@ def rodape_cenario(ind: dict) -> str:
     if not ind or ind["pedidos"] == 0:
         return f"Base analisada: {fmt_int((ind or {}).get('base', 0))} registros"
     fx = ind.get("faixas") or {}
-    faixas_txt = ""
-    if {"medio", "alto"} <= set(fx):
-        faixas_txt = (f"faixas do modelo: baixo < {fmt_pct(fx['medio'])} ≤ moderado < "
-                      f"{fmt_pct(fx['alto'])} ≤ alto")
     partes = [f"Predição: {ind['fonte']}", f"base analisada: {fmt_int(ind['base'])} registros"]
-    if faixas_txt:
-        partes.append(faixas_txt)
+    if {"medio", "alto"} <= set(fx):
+        partes.append(f"faixas do modelo: baixo < {fmt_pct(fx['medio'])} ≤ moderado < {fmt_pct(fx['alto'])} ≤ alto")
     if ind["amostra"] < ind["pedidos"]:
         partes.append(f"modelo aplicado a amostra de {fmt_int(ind['amostra'])} de {fmt_int(ind['pedidos'])} pedidos")
     return " · ".join(partes)
